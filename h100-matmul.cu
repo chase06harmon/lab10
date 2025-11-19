@@ -18,7 +18,7 @@ typedef __nv_bfloat16 bf16;
 
 #define L1_TILE_M 128
 #define L1_TILE_N 256
-#define L1_TILE_K 32
+#define L1_TILE_K 64
 #define NUM_BUFFS 4
 #define SHMEM_SIZE ((L1_TILE_M * L1_TILE_K + L1_TILE_N * L1_TILE_K) * NUM_BUFFS * sizeof(bf16))
 #define NUM_WARP_GROUPS_M (L1_TILE_M / 64)
@@ -30,6 +30,7 @@ typedef __nv_bfloat16 bf16;
 #define BLOCK_DIM_X ((LOADER_WARP + 1) * 32)
 #define BLOCK_DIM_Y 1
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+#define NUM_ITERS_PER_CTA 4
 
 __launch_bounds__(BLOCK_DIM_X, 0)
 __global__ void h100_matmul(
@@ -67,7 +68,7 @@ __global__ void h100_matmul(
     // Synchronize thread block and async proxy
     async_proxy_fence();
     __syncthreads();
-
+    
     // Producer
     if (warp_num == LOADER_WARP) {
 
@@ -77,39 +78,44 @@ __global__ void h100_matmul(
 
         int buffer_num;
         int coord_k;
-        int coord_m = blockIdx.x * L1_TILE_M;
-        int coord_n = blockIdx.y * L1_TILE_N;
         int phase_bit = 0;
 
-        for (int k = 0; k < K/L1_TILE_K; k++) {
+        for (int iter = 0; iter < NUM_ITERS_PER_CTA; iter++) {
+            
+            int coord_m = (blockIdx.x * NUM_ITERS_PER_CTA + iter) * L1_TILE_M;
+            int coord_n = blockIdx.y * L1_TILE_N;
 
-            // Buffer to store loaded tile in
-            buffer_num = k % NUM_BUFFS;
 
-            // Compute coordinates
-            coord_k = k * L1_TILE_K;
+            for (int k = 0; k < K/L1_TILE_K; k++) {
 
-            // Must wait for wgmma to complete first
-            if (k >= NUM_BUFFS) {
-                
-                // New phase in which subsequent loads occur
-                // Flips every NUM_BUFF iterations
-                phase_bit = (buffer_num == 0) ? phase_bit ^ 1: phase_bit;
+                // Buffer to store loaded tile in
+                buffer_num = k % NUM_BUFFS;
 
-                // Wait for consumers to finish using buffer
-                // Corresponds to previous phaase
-                wait(&(producer_locks[buffer_num]), phase_bit ^ 1);
-            }
+                // Compute coordinates
+                coord_k = k * L1_TILE_K;
 
-            // Set expected bytes, signal arrival, and launch TMA load
-            if (warp_lane == 0) {
-                expect_bytes_and_arrive(&(consumer_locks[buffer_num]), EXP_BYTES);
-                cp_async_bulk_tensor_2d_global_to_shared(
-                    A + buffer_num * L1_TILE_M * L1_TILE_K, &a_map, coord_k, coord_m, &(consumer_locks[buffer_num])
-                );
-                cp_async_bulk_tensor_2d_global_to_shared(
-                    B + buffer_num * L1_TILE_N * L1_TILE_K, &b_map, coord_k, coord_n, &(consumer_locks[buffer_num])
-                );
+                // Must wait for wgmma to complete first
+                if (iter > 0 || k >= NUM_BUFFS) {
+                    
+                    // New phase in which subsequent loads occur
+                    // Flips every NUM_BUFF iterations
+                    phase_bit = (buffer_num == 0) ? phase_bit ^ 1: phase_bit;
+
+                    // Wait for consumers to finish using buffer
+                    // Corresponds to previous phaase
+                    wait(&(producer_locks[buffer_num]), phase_bit ^ 1);
+                }
+
+                // Set expected bytes, signal arrival, and launch TMA load
+                if (warp_lane == 0) {
+                    expect_bytes_and_arrive(&(consumer_locks[buffer_num]), EXP_BYTES);
+                    cp_async_bulk_tensor_2d_global_to_shared(
+                        A + buffer_num * L1_TILE_M * L1_TILE_K, &a_map, coord_k, coord_m, &(consumer_locks[buffer_num])
+                    );
+                    cp_async_bulk_tensor_2d_global_to_shared(
+                        B + buffer_num * L1_TILE_N * L1_TILE_K, &b_map, coord_k, coord_n, &(consumer_locks[buffer_num])
+                    );
+                }
             }
         }
     }
@@ -122,10 +128,6 @@ __global__ void h100_matmul(
         // warpgroup_reg_alloc<184>();
 
         // Registers for output d
-        float d_vals[16][8];
-        
-        // Zero registers
-        memset(d_vals, 0, sizeof(d_vals));
 
         int coord_m = (wg_num % NUM_WARP_GROUPS_M) * 64;
         int coord_n = wg_num / NUM_WARP_GROUPS_M;
@@ -135,62 +137,86 @@ __global__ void h100_matmul(
 
 
         int buffer_num;
-        int phase_bit = 0;
         
         uint64_t A_desc0;
         uint64_t B_desc0;
         uint64_t A_desc1;
         uint64_t B_desc1;
+        uint64_t A_desc2;
+        uint64_t B_desc2;
+        uint64_t A_desc3;
+        uint64_t B_desc3;
+        
+        int phase_bit = 0;
 
-        // L1 Loop
-        for (int k = 0; k < K/L1_TILE_K; k++) {
+        for (int iter = 0; iter < NUM_ITERS_PER_CTA; iter++) {
+            float d_vals[16][8];
+        
+            // Zero registers
+            memset(d_vals, 0, sizeof(d_vals));
 
-            // Buffer to store loaded tile in
-            buffer_num = k % NUM_BUFFS;
+            // L1 Loop
+            for (int k = 0; k < K/L1_TILE_K; k++) {
 
-            // Create shared mem descriptors
-            A_desc0 = make_smem_desc<SWIZZLE_64B>(A + buffer_num * L1_TILE_M * L1_TILE_K + start_a, 1, 512);
-            B_desc0 = make_smem_desc<SWIZZLE_64B>(B + buffer_num * L1_TILE_N * L1_TILE_K + start_b, 1, 512);
-            A_desc1 = make_smem_desc<SWIZZLE_64B>(A + buffer_num * L1_TILE_M * L1_TILE_K + start_a + 16, 1, 512);
-            B_desc1 = make_smem_desc<SWIZZLE_64B>(B + buffer_num * L1_TILE_N * L1_TILE_K + start_b + 16, 1, 512);
+                // Buffer to store loaded tile in
+                buffer_num = k % NUM_BUFFS;
 
-            // New phase in which subsequent mma's occur
-            // Flips every NUM_BUFF iterations
-            phase_bit = (buffer_num == 0 && k != 0) ? phase_bit ^ 1: phase_bit;
-            
-            // Wait for TMA load
-            wait(&(consumer_locks[buffer_num]), phase_bit);
+                // Create shared mem descriptors
+                A_desc0 = make_smem_desc<SWIZZLE_128B>(A + buffer_num * L1_TILE_M * L1_TILE_K + start_a, 1, 1024);
+                B_desc0 = make_smem_desc<SWIZZLE_128B>(B + buffer_num * L1_TILE_N * L1_TILE_K + start_b, 1, 1024);
+                
+                A_desc1 = make_smem_desc<SWIZZLE_128B>(A + buffer_num * L1_TILE_M * L1_TILE_K + start_a + 16, 1, 1024);
+                B_desc1 = make_smem_desc<SWIZZLE_128B>(B + buffer_num * L1_TILE_N * L1_TILE_K + start_b + 16, 1, 1024);
+                
+                A_desc2 = make_smem_desc<SWIZZLE_128B>(A + buffer_num * L1_TILE_M * L1_TILE_K + start_a + 32, 1, 1024);
+                B_desc2 = make_smem_desc<SWIZZLE_128B>(B + buffer_num * L1_TILE_N * L1_TILE_K + start_b + 32, 1, 1024);
+                
+                A_desc3 = make_smem_desc<SWIZZLE_128B>(A + buffer_num * L1_TILE_M * L1_TILE_K + start_a + 48, 1, 1024);
+                B_desc3 = make_smem_desc<SWIZZLE_128B>(B + buffer_num * L1_TILE_N * L1_TILE_K + start_b + 48, 1, 1024);
+                
 
-            // Set expected bytes to 0 (no load)
-            expect_bytes(&(producer_locks[buffer_num]), 0);
+                // New phase in which subsequent mma's occur
+                // Flips every NUM_BUFF iterations
+                phase_bit = (buffer_num == 0 && k+iter != 0) ? phase_bit ^ 1: phase_bit;
+                
+                // Wait for TMA load
+                wait(&(consumer_locks[buffer_num]), phase_bit);
 
-            warpgroup_arrive();
-            
-            // Execute WGMMA
-            wgmma_n256<1, 1, 1, 0, 0>(A_desc0, B_desc0, d_vals);
-            wgmma_n256<1, 1, 1, 0, 0>(A_desc1, B_desc1, d_vals);
+                // Set expected bytes to 0 (no load)
+                expect_bytes(&(producer_locks[buffer_num]), 0);
 
-            // Commit and sync
-            wgmma_commit();
-            wgmma_wait<0>();
+                warpgroup_arrive();
+                
+                // Execute WGMMA
+                wgmma_n256<1, 1, 1, 0, 0>(A_desc0, B_desc0, d_vals);
+                wgmma_n256<1, 1, 1, 0, 0>(A_desc1, B_desc1, d_vals);
+                wgmma_n256<1, 1, 1, 0, 0>(A_desc2, B_desc2, d_vals);
+                wgmma_n256<1, 1, 1, 0, 0>(A_desc3, B_desc3, d_vals);
 
-            // Signal compute finish by incrementing arrival count
-            arrive(&(producer_locks[buffer_num]), 1);
-        }
+                // How are they the same? No offset?
 
-        // Writeback
-        for (int i = 0; i < 128; i+=4) {
+                // Commit and sync
+                wgmma_commit();
+                wgmma_wait<0>();
 
-            int m = blockIdx.x * L1_TILE_M + wg_num * 64 + 16 * wg_warp_num + warp_lane / 4;
-            int n = blockIdx.y * L1_TILE_N + (warp_lane % 4) * 2 + i * 2;
-            int wr_index = n * M + m;
-            
-            int row = i / 8;
-            int start_col = i % 8;
-            C[wr_index] = (bf16) d_vals[row][start_col];
-            C[wr_index + M] = (bf16) d_vals[row][start_col + 1];
-            C[wr_index + 8] = (bf16) d_vals[row][start_col + 2];
-            C[wr_index + M + 8] = (bf16) d_vals[row][start_col + 3];
+                // Signal compute finish by incrementing arrival count
+                arrive(&(producer_locks[buffer_num]), 1);
+            }
+
+            // Writeback
+            for (int i = 0; i < 128; i+=4) {
+
+                int m = ((blockIdx.x * NUM_ITERS_PER_CTA + iter) * L1_TILE_M) + wg_num * 64 + 16 * wg_warp_num + warp_lane / 4;
+                int n = blockIdx.y * L1_TILE_N + (warp_lane % 4) * 2 + i * 2;
+                int wr_index = n * M + m;
+                
+                int row = i / 8;
+                int start_col = i % 8;
+                C[wr_index] = (bf16) d_vals[row][start_col];
+                C[wr_index + M] = (bf16) d_vals[row][start_col + 1];
+                C[wr_index + 8] = (bf16) d_vals[row][start_col + 2];
+                C[wr_index + M + 8] = (bf16) d_vals[row][start_col + 3];
+            }
         }
     }
 }
@@ -208,6 +234,8 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     uint32_t a_boxDim[2] = {L1_TILE_K, L1_TILE_M};
     uint32_t a_elementStrides[2] = {1, 1};
 
+    // std::cout << "Shared Mem Size: " << SHMEM_SIZE << std::endl;
+
     CUtensorMap a_map;
     CUDA_CHECK(cuTensorMapEncodeTiled(
         &a_map,
@@ -219,7 +247,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         a_boxDim,
         a_elementStrides,
         CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_64B,
+        CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
@@ -239,11 +267,11 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         b_boxDim,
         b_elementStrides,
         CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_64B,
+        CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    dim3 gridDim = dim3(CEIL_DIV(M, L1_TILE_M), CEIL_DIV(N, L1_TILE_N));
+    dim3 gridDim = dim3(CEIL_DIV(M, L1_TILE_M * NUM_ITERS_PER_CTA), CEIL_DIV(N, L1_TILE_N));
     dim3 blockDim = dim3(BLOCK_DIM_X, BLOCK_DIM_Y);
 
     h100_matmul<<<gridDim, blockDim, SHMEM_SIZE>>>(M, N, K, a_map, b_map, C);
